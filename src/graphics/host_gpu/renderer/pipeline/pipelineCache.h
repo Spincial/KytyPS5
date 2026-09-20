@@ -5,11 +5,13 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -17,6 +19,8 @@
 #include <unordered_map>
 
 namespace Libs::Graphics {
+
+class ShaderCompilerThread;
 
 struct GraphicContext;
 struct RenderColorInfo;
@@ -110,6 +114,15 @@ public:
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
 
+	// Starts the dedicated shader compiler thread. Shader cache misses are then
+	// compiled off the GPU thread; callers must handle the pending state reported
+	// through GetGraphicsPrograms/GetComputeProgram.
+	void StartShaderCompiler();
+	// Installs/removes the notification invoked when an async shader compilation
+	// completes.
+	void SetShaderReadyCallback(Common::UniqueFunction<void>&& callback);
+	void ClearShaderReadyCallback();
+
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
@@ -124,16 +137,19 @@ public:
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
 
+	// When the optional out-parameter reports pending shaders, the returned programs are
+	// incomplete: an async compilation was requested and the caller must retry later.
 	GraphicsPrograms
 	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
 	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
 	                    const HW::Context& context, const HW::UserConfig& user_config,
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	                    ShaderPixelInputInfo& pixel_info, bool* shaders_pending = nullptr);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
-	                                ShaderComputeInputInfo&      input_info);
+	                                ShaderComputeInputInfo&      input_info,
+	                                bool*                        shaders_pending = nullptr);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
@@ -168,10 +184,17 @@ private:
 		}
 
 		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params) {
+			// The packed struct has byte alignment; hash it one word at a time.
 			const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
-			for (std::size_t i = 0; i < sizeof(params); i++) {
-				Mix(hash, bytes[i]);
+			for (std::size_t i = 0; i + sizeof(uint64_t) <= sizeof(params); i += sizeof(uint64_t)) {
+				uint64_t chunk = 0;
+				std::memcpy(&chunk, bytes + i, sizeof(chunk));
+				Mix(hash, static_cast<std::size_t>(chunk));
 			}
+			uint64_t tail = 0;
+			std::memcpy(&tail, bytes + (sizeof(params) & ~static_cast<std::size_t>(7u)),
+			            sizeof(params) & 7u);
+			Mix(hash, static_cast<std::size_t>(tail));
 		}
 
 		static void MixRendering(std::size_t& hash, const PipelineRenderingState& rendering) {
@@ -216,7 +239,15 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 
+	// Declared last so the compiler thread and its notification die first: queued
+	// compilation tasks still publish into the program caches below them.
+	Common::Mutex                        m_shader_ready_mutex;
+	Common::UniqueFunction<void>         m_shader_ready_callback;
+	std::unique_ptr<ShaderCompilerThread> m_shader_compiler;
+
 	void InitializeDriverCache();
+	[[nodiscard]] bool ShaderCompilerActive() const;
+	void               NotifyShaderReady();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

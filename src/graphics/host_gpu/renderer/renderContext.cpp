@@ -28,11 +28,18 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
+	// Shader cache misses now compile on the dedicated Thread_ShaderCompiler; when a
+	// compilation completes it nudges the GPU thread to retry suspended submissions.
+	m_pipeline_cache.StartShaderCompiler();
+	m_pipeline_cache.SetShaderReadyCallback([this] { m_gpu->NotifyShaderReady(); });
 }
 
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
+		// Drop the notification after the GPU thread joins but before the object goes
+		// away; ClearShaderReadyCallback serializes with any in-flight completion.
+		m_pipeline_cache.ClearShaderReadyCallback();
 		m_gpu.reset();
 	}
 	if (m_video_out != nullptr) {

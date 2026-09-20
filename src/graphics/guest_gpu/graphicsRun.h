@@ -30,6 +30,9 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// Wakes the GPU thread after an async shader compilation completes so suspended
+	// submissions retry with the newly installed programs.
+	void               NotifyShaderReady();
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void              Submit(std::span<const uint32_t> draw_commands,
