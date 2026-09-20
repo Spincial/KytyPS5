@@ -266,6 +266,8 @@ struct PipelineCache::ProgramCache {
 		ShaderVertexInputInfo                        vertex_input {};
 		ShaderPixelInputInfo                         pixel_input {};
 		ShaderComputeInputInfo                       compute_input {};
+		ShaderRecompiler::TranslateResult             translated;
+		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::ResourceSnapshot       probe_resources;
 		uint32_t                                     push_data_cursor = 0;
@@ -273,58 +275,12 @@ struct PipelineCache::ProgramCache {
 	};
 
 	struct CompiledPermutation {
-		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		vk::ShaderModule                             module = nullptr;
 	};
 
 	static constexpr std::size_t MaxStaticKeyWords = 13 + ShaderVertexInputInfo::RES_MAX * 13;
-
-	// Translates guest code, materializes resources, emits SPIR-V, runs validation and
-	// dumps, and creates the Vulkan shader module. This touches no shared state, so it
-	// runs on the dedicated shader compiler thread.
-	[[nodiscard]] CompiledPermutation CompilePermutationOffline(CompileJob& job) {
-		auto               translated = ShaderRecompiler::TranslateProgram(job.code, job.options);
-		CompiledPermutation compiled;
-		if (job.have_specialization) {
-			// The source entry existed; the cache probe already resolved runtime resources.
-			compiled.specialization = std::move(job.specialization);
-			compiled.resources      = std::move(job.probe_resources);
-		} else {
-			compiled.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			const ShaderRecompiler::IR::SrtRuntime runtime {
-			    .user_data                  = job.user_data,
-			    .shader_base                = job.base_addr,
-			    .read_specialization_memory = ReadShaderGuestMemory,
-			    .validate_memory_range      = ValidateShaderGuestMemoryRange,
-			};
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(compiled.resource_plan, runtime,
-			                                                    compiled.resources,
-			                                                    compiled.specialization));
-		}
-		const char* stage_name = ShaderStageShortName(job.options.stage);
-		auto        result     = ShaderRecompiler::CompileProgram(std::move(translated), job.options,
-                                                          compiled.specialization,
-                                                          job.push_data_cursor);
-		DumpShaderOriginal(stage_name, job.options.shader_hash, job.code, result.decoded_dump);
-		if (!ValidateShaderSpirv(job.options.dump_label, job.options.shader_hash, result.spirv)) {
-			DumpShaderSpirv(stage_name, job.options.shader_hash, result.spirv);
-			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n",
-			     job.options.dump_label, job.options.shader_hash);
-		}
-		DumpShaderSpirv(stage_name, job.options.shader_hash, result.spirv);
-
-		compiled.module = CompileSPV(result.spirv, device);
-		EXIT_IF(compiled.module == nullptr);
-		if (job.options.dump_ir) {
-			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", job.options.dump_label,
-			     static_cast<uint64_t>(result.spirv.size()), job.options.wave_size);
-		}
-		compiled.program = std::move(result.program).TakeCompiledInfo();
-		return compiled;
-	}
 
 	void LogShaderCounts() {
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
@@ -343,13 +299,40 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 	}
 
+	// Emits SPIR-V from a translated job, runs validation and dumps, and creates the
+	// Vulkan module. The caller must already have resolved the specialization.
+	[[nodiscard]] CompiledPermutation EmitPermutation(CompileJob& job) {
+		CompiledPermutation compiled;
+		compiled.specialization = job.specialization;
+		const char* stage_name  = ShaderStageShortName(job.options.stage);
+		auto        result      = ShaderRecompiler::CompileProgram(std::move(job.translated),
+                                                                   job.options, compiled.specialization,
+                                                                   job.push_data_cursor);
+		DumpShaderOriginal(stage_name, job.options.shader_hash, job.code, result.decoded_dump);
+		if (!ValidateShaderSpirv(job.options.dump_label, job.options.shader_hash, result.spirv)) {
+			DumpShaderSpirv(stage_name, job.options.shader_hash, result.spirv);
+			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n",
+			     job.options.dump_label, job.options.shader_hash);
+		}
+		DumpShaderSpirv(stage_name, job.options.shader_hash, result.spirv);
+
+		compiled.module = CompileSPV(result.spirv, device);
+		EXIT_IF(compiled.module == nullptr);
+		if (job.options.dump_ir) {
+			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", job.options.dump_label,
+			     static_cast<uint64_t>(result.spirv.size()), job.options.wave_size);
+		}
+		compiled.program = std::move(result.program).TakeCompiledInfo();
+		return compiled;
+	}
+
 	// Publishes a finished permutation. The caller must hold PipelineCache::m_mutex.
 	// If a duplicate permutation arrived first (same push-data start and
 	// specialization), the redundant module is destroyed and the existing one returned.
-	Permutation& InstallPermutation(const CompileJob& job, CompiledPermutation&& compiled) {
+	Permutation& InstallPermutation(CompileJob& job, CompiledPermutation&& compiled) {
 		auto entry = programs.find(job.key);
 		if (entry == programs.end()) {
-			entry = programs.try_emplace(job.key, std::move(compiled.resource_plan)).first;
+			entry = programs.try_emplace(job.key, std::move(job.resource_plan)).first;
 		}
 		const auto permutation = std::ranges::find_if(
 		    entry->second.permutations, [&](const Permutation& candidate) {
@@ -369,12 +352,61 @@ struct PipelineCache::ProgramCache {
 		return entry->second.permutations.back();
 	}
 
-	// Shader compiler thread entry point: compiles the job and publishes the result.
-	void CompleteShaderJob(std::unique_ptr<CompileJob> job) {
-		auto compiled = CompilePermutationOffline(*job);
+	// Resolves a new source entry's resources from guest memory. Must run on the GPU
+	// thread: the GPU-clean memory reader inside MaterializeResources is only valid
+	// there. The resolved snapshot itself is discarded; the caller's cache probe
+	// re-materializes it when the draw retries.
+	void ResolveJobResources(CompileJob& job) {
+		const ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data                  = job.user_data,
+		    .shader_base                = job.base_addr,
+		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .validate_memory_range      = ValidateShaderGuestMemoryRange,
+		};
+		ShaderRecompiler::IR::ResourceSnapshot snapshot;
+		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(job.resource_plan, runtime, snapshot,
+		                                                    job.specialization));
+		job.have_specialization = true;
+	}
+
+	// Shader compiler thread, phase 2: SPIR-V emission and publication.
+	void EmitAndPublishJob(std::unique_ptr<CompileJob> job) {
+		auto              compiled = EmitPermutation(*job);
 		Common::LockGuard lock(m_owner.m_mutex);
 		InstallPermutation(*job, std::move(compiled));
 		pending.erase(job->key);
+	}
+
+	// Shader compiler thread, phase 1: translation. A new source entry also extracts
+	// its resource plan and parks the job: resolving the plan reads GPU-clean memory,
+	// which only the GPU thread may do, so the waiter hands it back in between.
+	void TranslateShaderJob(std::unique_ptr<CompileJob> job) {
+		job->translated = ShaderRecompiler::TranslateProgram(job->code, job->options);
+		if (!job->have_specialization) {
+			job->resource_plan =
+			    ShaderRecompiler::IR::ExtractResourcePlan(job->translated.program);
+			Common::LockGuard lock(m_owner.m_mutex);
+			m_materialize_requests.push_back(std::move(job));
+			return;
+		}
+		EmitAndPublishJob(std::move(job));
+	}
+
+	// GPU thread: resolves jobs parked by the compiler thread and re-queues them for
+	// emission. Called between shader-completion waits.
+	void ServiceMaterializationRequests() {
+		std::vector<std::unique_ptr<CompileJob>> requests;
+		{
+			Common::LockGuard lock(m_owner.m_mutex);
+			requests = std::move(m_materialize_requests);
+			m_materialize_requests.clear();
+		}
+		for (auto& job: requests) {
+			ResolveJobResources(*job);
+			m_owner.m_shader_compiler->Submit([this, job = std::move(job)]() mutable {
+				EmitAndPublishJob(std::move(job));
+			});
+		}
 	}
 
 	template <typename InputInfo>
@@ -471,7 +503,7 @@ struct PipelineCache::ProgramCache {
 				pending.insert(job_ptr->key);
 				m_owner.m_shader_compiler->Submit(
 				    [this, job = std::move(job_ptr)]() mutable {
-					    CompleteShaderJob(std::move(job));
+					    TranslateShaderJob(std::move(job));
 				    });
 			}
 			// Snapshot the completion count while the cache mutex is still held: no
@@ -482,12 +514,29 @@ struct PipelineCache::ProgramCache {
 			return {};
 		}
 
-		// Synchronous fallback (no compiler thread): compile on the calling thread.
-		auto compiled     = CompilePermutationOffline(job);
-		auto& permutation = InstallPermutation(job, std::move(compiled));
-		input_info.stage  = {.program = &permutation.program, .resources = std::move(compiled.resources)};
-		permutation.program.bindings.AdvancePushData(push_data_cursor);
-		return permutation.handle;
+		// Synchronous fallback (no compiler thread): translate, resolve, and emit on
+		// the calling thread.
+		job.translated = ShaderRecompiler::TranslateProgram(job.code, job.options);
+		if (!job.have_specialization) {
+			job.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(job.translated.program);
+			const ShaderRecompiler::IR::SrtRuntime runtime {
+			    .user_data                  = job.user_data,
+			    .shader_base                = job.base_addr,
+			    .read_specialization_memory = ReadShaderGuestMemory,
+			    .validate_memory_range      = ValidateShaderGuestMemoryRange,
+			};
+			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(job.resource_plan, runtime,
+			                                                    job.probe_resources,
+			                                                    job.specialization));
+		}
+		{
+			auto compiled     = EmitPermutation(job);
+			auto& permutation = InstallPermutation(job, std::move(compiled));
+			input_info.stage  = {.program   = &permutation.program,
+			                    .resources = std::move(job.probe_resources)};
+			permutation.program.bindings.AdvancePushData(push_data_cursor);
+			return permutation.handle;
+		}
 	}
 
 	explicit ProgramCache(PipelineCache& owner, vk::Device device)
@@ -507,6 +556,8 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	// Program keys with a compilation queued or running on the compiler thread.
 	std::unordered_set<ProgramKey, ProgramKeyHash> pending;
+	// Translated jobs waiting for the GPU thread to resolve their resources.
+	std::vector<std::unique_ptr<CompileJob>>       m_materialize_requests;
 	ProgramKey                                      lookup_key;
 	vk::Device                                      device;
 	uint64_t                                        next_shader_id = 0;
@@ -791,6 +842,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				return result;
 			}
 		}
+		// A parked job may need this (GPU) thread to resolve its resources before the
+		// compiler thread can emit it.
+		m_program_cache->ServiceMaterializationRequests();
 		m_shader_compiler->WaitNextCompletion(wait_target);
 	}
 }
@@ -814,6 +868,9 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 				return program;
 			}
 		}
+		// A parked job may need this (GPU) thread to resolve its resources before the
+		// compiler thread can emit it.
+		m_program_cache->ServiceMaterializationRequests();
 		m_shader_compiler->WaitNextCompletion(wait_target);
 	}
 }
