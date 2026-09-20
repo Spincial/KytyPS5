@@ -357,6 +357,7 @@ struct PipelineCache::ProgramCache {
 	// there. The resolved snapshot itself is discarded; the caller's cache probe
 	// re-materializes it when the draw retries.
 	void ResolveJobResources(CompileJob& job) {
+		KYTY_PROFILER_BLOCK("ShaderCompile ResolveResources", profiler::colors::Amber300);
 		const ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = job.user_data,
 		    .shader_base                = job.base_addr,
@@ -371,6 +372,7 @@ struct PipelineCache::ProgramCache {
 
 	// Shader compiler thread, phase 2: SPIR-V emission and publication.
 	void EmitAndPublishJob(std::unique_ptr<CompileJob> job) {
+		KYTY_PROFILER_BLOCK("ShaderCompile EmitSPIRV", profiler::colors::CyanA700);
 		auto              compiled = EmitPermutation(*job);
 		Common::LockGuard lock(m_owner.m_mutex);
 		InstallPermutation(*job, std::move(compiled));
@@ -381,6 +383,7 @@ struct PipelineCache::ProgramCache {
 	// its resource plan and parks the job: resolving the plan reads GPU-clean memory,
 	// which only the GPU thread may do, so the waiter hands it back in between.
 	void TranslateShaderJob(std::unique_ptr<CompileJob> job) {
+		KYTY_PROFILER_BLOCK("ShaderCompile Translate", profiler::colors::CyanA700);
 		job->translated = ShaderRecompiler::TranslateProgram(job->code, job->options);
 		if (!job->have_specialization) {
 			job->resource_plan =
@@ -845,6 +848,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		// A parked job may need this (GPU) thread to resolve its resources before the
 		// compiler thread can emit it.
 		m_program_cache->ServiceMaterializationRequests();
+		KYTY_PROFILER_BLOCK("ShaderCompile Wait", profiler::colors::DeepOrangeA200);
 		m_shader_compiler->WaitNextCompletion(wait_target);
 	}
 }
@@ -871,6 +875,7 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		// A parked job may need this (GPU) thread to resolve its resources before the
 		// compiler thread can emit it.
 		m_program_cache->ServiceMaterializationRequests();
+		KYTY_PROFILER_BLOCK("ShaderCompile Wait", profiler::colors::DeepOrangeA200);
 		m_shader_compiler->WaitNextCompletion(wait_target);
 	}
 }
