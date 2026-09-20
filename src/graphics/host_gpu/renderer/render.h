@@ -53,15 +53,6 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
-// Outcome of preparing a draw: Ready records the draw, Skip silently drops it
-// (for example, no framebuffer), and PendingShader asks the caller to retry once
-// the async shader compiler thread has published the missing programs.
-enum class DrawPrepareStatus : uint8_t {
-	Ready,
-	Skip,
-	PendingShader,
-};
-
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
 	const void*      index_addr                 = nullptr;
@@ -163,9 +154,7 @@ public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
-	// Returns false when the dispatch waits on an async shader compilation and must be
-	// retried once the shader is ready; every other outcome returns true.
-	bool DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
+	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
@@ -177,10 +166,8 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
-	// Returns false when the draw waits on an async shader compilation and must be
-	// retried once the shader is ready; every other outcome returns true.
-	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
-	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -196,10 +183,10 @@ private:
 	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
-	[[nodiscard]] DrawPrepareStatus PrepareDrawRenderState(CommandBuffer& buffer,
-	                                                      const DrawCallInfo& draw,
-	                                                      uint32_t render_target_slice_offset,
-	                                                      DrawRenderState& state);
+	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
+	                                          const DrawCallInfo& draw,
+	                                          uint32_t            render_target_slice_offset,
+	                                          DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,

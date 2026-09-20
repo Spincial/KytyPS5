@@ -372,17 +372,14 @@ struct PipelineCache::ProgramCache {
 	// Shader compiler thread entry point: compiles the job and publishes the result.
 	void CompleteShaderJob(std::unique_ptr<CompileJob> job) {
 		auto compiled = CompilePermutationOffline(*job);
-		{
-			Common::LockGuard lock(m_owner.m_mutex);
-			InstallPermutation(*job, std::move(compiled));
-			pending.erase(job->key);
-		}
-		m_owner.NotifyShaderReady();
+		Common::LockGuard lock(m_owner.m_mutex);
+		InstallPermutation(*job, std::move(compiled));
+		pending.erase(job->key);
 	}
 
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                 uint32_t& push_data_cursor, bool& shaders_pending) {
+	                 uint32_t& push_data_cursor, bool& shaders_pending, uint64_t& wait_target) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -427,8 +424,11 @@ struct PipelineCache::ProgramCache {
 		}
 
 		// Cache miss: assemble a self-contained job that compiles identically whether
-		// it runs inline or on the dedicated shader compiler thread.
-		CompileJob job;
+		// it runs inline or on the dedicated shader compiler thread. The job is built in
+		// place inside its final storage: options.input_info points into the stage-input
+		// copies, so the CompileJob itself must never be moved afterwards.
+		auto job_ptr = std::make_unique<CompileJob>();
+		auto& job    = *job_ptr;
 		job.key                 = lookup_key;
 		job.code.assign(params.code.begin(), params.code.end());
 		job.back_code.assign(params.back_code.begin(), params.back_code.end());
@@ -465,18 +465,19 @@ struct PipelineCache::ProgramCache {
 		}
 
 		if (m_owner.ShaderCompilerActive()) {
-			// A single in-flight job per program key: extra waiters just retry once the
-			// pending compilation publishes its permutation.
-			if (pending.contains(lookup_key)) {
-				shaders_pending = true;
-				return {};
+			// A single in-flight job per program key: a concurrent waiter reuses the
+			// pending compilation instead of queueing a duplicate.
+			if (!pending.contains(lookup_key)) {
+				pending.insert(job_ptr->key);
+				m_owner.m_shader_compiler->Submit(
+				    [this, job = std::move(job_ptr)]() mutable {
+					    CompleteShaderJob(std::move(job));
+				    });
 			}
-			auto job_ptr = std::make_unique<CompileJob>(std::move(job));
-			pending.insert(job_ptr->key);
-			m_owner.m_shader_compiler->Submit(
-			    [this, job = std::move(job_ptr)]() mutable {
-				    CompleteShaderJob(std::move(job));
-			    });
+			// Snapshot the completion count while the cache mutex is still held: no
+			// queued job can publish before this read, so the caller's wait always
+			// covers this request.
+			wait_target = m_owner.m_shader_compiler->CompletedCount();
 			shaders_pending = true;
 			return {};
 		}
@@ -546,23 +547,6 @@ void PipelineCache::StartShaderCompiler() {
 		m_shader_compiler = std::make_unique<ShaderCompilerThread>();
 	}
 	m_shader_compiler->Start();
-}
-
-void PipelineCache::SetShaderReadyCallback(Common::UniqueFunction<void>&& callback) {
-	Common::LockGuard lock(m_shader_ready_mutex);
-	m_shader_ready_callback = std::move(callback);
-}
-
-void PipelineCache::ClearShaderReadyCallback() {
-	Common::LockGuard lock(m_shader_ready_mutex);
-	m_shader_ready_callback = {};
-}
-
-void PipelineCache::NotifyShaderReady() {
-	Common::LockGuard lock(m_shader_ready_mutex);
-	if (m_shader_ready_callback) {
-		m_shader_ready_callback();
-	}
 }
 
 bool PipelineCache::ShaderCompilerActive() const {
@@ -718,8 +702,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
-    bool* shaders_pending) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -779,45 +762,60 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
-	Common::LockGuard lock(m_mutex);
-	uint32_t          push_data_cursor =
-	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
-	GraphicsPrograms result;
-	bool             pending = false;
-	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor, pending);
-	}
-	if (!pending) {
-		for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-			result.vertex[i] =
-			    m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor, pending);
-			// Only the first missing stage is queued per pass: later stages need this
-			// stage's push-data cursor, which is known only once it is compiled.
-			if (pending) {
-				break;
+	// Missing stages queue on the shader compiler thread; each pass queues at most one
+	// job (later stages need the compiled stage's push-data cursor) and waits for it
+	// before re-probing. The wait happens outside the cache mutex so the compiler
+	// thread can publish.
+	for (;;) {
+		uint64_t wait_target = 0;
+		bool     pending     = false;
+		{
+			Common::LockGuard lock(m_mutex);
+			uint32_t          push_data_cursor =
+			    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+			GraphicsPrograms result;
+			if (pixel_active) {
+				result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor,
+				                                    pending, wait_target);
+			}
+			if (!pending) {
+				for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
+					result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i],
+					                                        push_data_cursor, pending, wait_target);
+					if (pending) {
+						break;
+					}
+				}
+			}
+			if (!pending) {
+				return result;
 			}
 		}
+		m_shader_compiler->WaitNextCompletion(wait_target);
 	}
-	if (shaders_pending != nullptr) {
-		*shaders_pending = pending;
-	}
-	return result;
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info,
-                                               bool*                        shaders_pending) {
+                                               ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
-	const auto        params      = PrepareProgram(regs, sh, input_info);
-	Common::LockGuard lock(m_mutex);
-	uint32_t          push_data_cursor = 0;
-	bool              pending          = false;
-	const auto program = m_program_cache->Get(params, input_info, push_data_cursor, pending);
-	if (shaders_pending != nullptr) {
-		*shaders_pending = pending;
+	const auto params = PrepareProgram(regs, sh, input_info);
+	// A cache miss compiles on the shader compiler thread; wait for it outside the
+	// cache mutex and re-probe.
+	for (;;) {
+		uint64_t    wait_target = 0;
+		bool        pending     = false;
+		ShaderProgram program;
+		{
+			Common::LockGuard lock(m_mutex);
+			uint32_t          push_data_cursor = 0;
+			program = m_program_cache->Get(params, input_info, push_data_cursor, pending, wait_target);
+			if (!pending) {
+				return program;
+			}
+		}
+		m_shader_compiler->WaitNextCompletion(wait_target);
 	}
-	return program;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

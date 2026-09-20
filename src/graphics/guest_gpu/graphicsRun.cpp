@@ -126,18 +126,6 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_work_available.Signal();
 }
 
-void GuestGpu::NotifyShaderReady() {
-	Common::LockGuard lock(m_queue_mutex);
-	// A pending shader compilation finished: let blocked submissions retry so they
-	// pick up the freshly installed programs.
-	for (auto& queue: m_queues) {
-		if (!queue.empty()) {
-			queue.front().blocked = false;
-		}
-	}
-	m_work_available.Signal();
-}
-
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
@@ -885,7 +873,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
-bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
+void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	CheckBuffer();
 
 	args.index_type_and_size = m_index_type_and_size;
@@ -896,11 +884,7 @@ bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
-	if (!m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args)) {
-		SuspendPm4();
-		return false;
-	}
-	return true;
+	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -1033,13 +1017,11 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 				}
 			}
 			m_num_instances = args->instance_count;
-			if (!DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
-			                    .instance_count = args->instance_count,
-			                    .first_vertex   = args->start_vertex_location,
-			                    .first_instance = args->start_instance_location,
-			                    .offset_source  = DrawOffsetSource::IndirectArgs})) {
-				return;
-			}
+			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
+			               .instance_count = args->instance_count,
+			               .first_vertex   = args->start_vertex_location,
+			               .first_instance = args->start_instance_location,
+			               .offset_source  = DrawOffsetSource::IndirectArgs});
 			continue;
 		}
 
@@ -1081,14 +1063,12 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 
 		m_num_instances = args->instance_count;
-		if (!DrawIndex({.index_count    = index_count,
-		                .index_addr     = index_addr,
-		                .instance_count = args->instance_count,
-		                .base_vertex    = static_cast<int32_t>(args->base_vertex_location),
-		                .first_instance = args->start_instance_location,
-		                .offset_source  = DrawOffsetSource::IndirectArgs})) {
-			return;
-		}
+		DrawIndex({.index_count    = index_count,
+		           .index_addr     = index_addr,
+		           .instance_count = args->instance_count,
+		           .base_vertex    = static_cast<int32_t>(args->base_vertex_location),
+		           .first_instance = args->start_instance_location,
+		           .offset_source  = DrawOffsetSource::IndirectArgs});
 	}
 }
 
@@ -1127,11 +1107,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		// local_x        = std::max(cs.num_thread_x, 1u);
 		// local_y        = std::max(cs.num_thread_y, 1u);
 		// local_z        = std::max(cs.num_thread_z, 1u);
-		if (!m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(),
-		                                                   thread_group_x, thread_group_y,
-		                                                   thread_group_z, mode)) {
-			SuspendPm4();
-		}
+		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
+		                                              thread_group_y, thread_group_z, mode);
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
@@ -1172,17 +1149,13 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
 }
 
-bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	CheckBuffer();
 
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
 	}
-	if (!m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args)) {
-		SuspendPm4();
-		return false;
-	}
-	return true;
+	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {

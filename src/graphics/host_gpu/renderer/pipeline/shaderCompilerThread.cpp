@@ -24,6 +24,18 @@ bool ShaderCompilerThread::IsRunning() const {
 	return m_running;
 }
 
+uint64_t ShaderCompilerThread::CompletedCount() const {
+	Common::LockGuard lock(m_mutex);
+	return m_completed_count;
+}
+
+void ShaderCompilerThread::WaitNextCompletion(uint64_t known) const {
+	Common::LockGuard lock(m_mutex);
+	while (m_completed_count <= known) {
+		m_completed.Wait(&m_mutex);
+	}
+}
+
 void ShaderCompilerThread::Stop() {
 	{
 		Common::LockGuard lock(m_mutex);
@@ -71,6 +83,11 @@ void ShaderCompilerThread::ThreadRun(void* data) {
 			self->m_tasks.pop_front();
 		}
 		task();
+		{
+			Common::LockGuard lock(self->m_mutex);
+			self->m_completed_count++;
+			self->m_completed.SignalAll();
+		}
 	}
 }
 

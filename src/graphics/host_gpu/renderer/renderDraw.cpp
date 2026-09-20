@@ -877,9 +877,7 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-// Returns false when the required shader programs are still compiling on the
-// shader compiler thread and the draw must be retried later.
-static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
+static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
@@ -905,22 +903,16 @@ static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
-	bool shaders_pending = false;
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
-	    &shaders_pending);
-	return !shaders_pending;
+	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
 }
 
-DrawPrepareStatus RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer,
-                                                          const DrawCallInfo& draw,
-                                                          uint32_t            render_target_slice_offset,
-                                                          DrawRenderState& state) {
+bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                             uint32_t            render_target_slice_offset,
+                                             DrawRenderState& state) {
 	state.ps_active = DrawHasActivePixelShader(buffer);
-	if (!RefreshShaders(buffer, draw, state)) {
-		return DrawPrepareStatus::PendingShader;
-	}
+	RefreshShaders(buffer, draw, state);
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -949,10 +941,10 @@ DrawPrepareStatus RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer,
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
-		return DrawPrepareStatus::Skip;
+		return false;
 	}
 
-	return DrawPrepareStatus::Ready;
+	return true;
 }
 
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
@@ -1215,7 +1207,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
-bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                 const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1231,17 +1223,17 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || args.instance_count == 0) {
-		return true;
+		return;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
-		return true;
+		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
-		return true;
+		return;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1267,7 +1259,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, false, topology)) {
-		return true;
+		return;
 	}
 
 	DrawIndexBufferSource index_source {};
@@ -1304,10 +1296,9 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
 	DrawRenderState state {};
-	switch (PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
-		case DrawPrepareStatus::PendingShader: return false;
-		case DrawPrepareStatus::Skip: ResetBindings(); return true;
-		case DrawPrepareStatus::Ready: break;
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+		ResetBindings();
+		return;
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
@@ -1324,11 +1315,10 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
 	ResetBindings();
-	return true;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer,
+void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer,
                               const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1344,17 +1334,17 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.vertex_count == 0 || args.instance_count == 0) {
-		return true;
+		return;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
-		return true;
+		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
-		return true;
+		return;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1380,13 +1370,12 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer,
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, true, topology)) {
 		ResetBindings();
-		return true;
+		return;
 	}
 	DrawRenderState state {};
-	switch (PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
-		case DrawPrepareStatus::PendingShader: return false;
-		case DrawPrepareStatus::Skip: ResetBindings(); return true;
-		case DrawPrepareStatus::Ready: break;
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+		ResetBindings();
+		return;
 	}
 
 	const bool rect_list = ucfg.GetPrimType() == Prospero::PrimitiveType::kRectList;
@@ -1400,7 +1389,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer,
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
 		ResetBindings();
-		return true;
+		return;
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, 0, nullptr);
@@ -1416,7 +1405,6 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer,
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
 	ResetBindings();
-	return true;
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {
