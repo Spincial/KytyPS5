@@ -195,8 +195,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
-                                     uint32_t thread_group_x, uint32_t thread_group_y,
-                                     uint32_t thread_group_z, uint32_t mode) {
+                                    uint32_t thread_group_x, uint32_t thread_group_y,
+                                    uint32_t thread_group_z, uint32_t mode) {
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();

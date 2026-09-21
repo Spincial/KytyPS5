@@ -266,12 +266,12 @@ struct PipelineCache::ProgramCache {
 		ShaderVertexInputInfo                        vertex_input {};
 		ShaderPixelInputInfo                         pixel_input {};
 		ShaderComputeInputInfo                       compute_input {};
-		ShaderRecompiler::TranslateResult             translated;
+		ShaderRecompiler::TranslateResult            translated;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::ResourceSnapshot       probe_resources;
-		uint32_t                                     push_data_cursor = 0;
-		bool                                         have_specialization  = false;
+		uint32_t                                     push_data_cursor    = 0;
+		bool                                         have_specialization = false;
 	};
 
 	struct CompiledPermutation {
@@ -305,9 +305,8 @@ struct PipelineCache::ProgramCache {
 		CompiledPermutation compiled;
 		compiled.specialization = job.specialization;
 		const char* stage_name  = ShaderStageShortName(job.options.stage);
-		auto        result      = ShaderRecompiler::CompileProgram(std::move(job.translated),
-                                                                   job.options, compiled.specialization,
-                                                                   job.push_data_cursor);
+		auto        result      = ShaderRecompiler::CompileProgram(
+		    std::move(job.translated), job.options, compiled.specialization, job.push_data_cursor);
 		DumpShaderOriginal(stage_name, job.options.shader_hash, job.code, result.decoded_dump);
 		if (!ValidateShaderSpirv(job.options.dump_label, job.options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, job.options.shader_hash, result.spirv);
@@ -334,8 +333,8 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(job.key, std::move(job.resource_plan)).first;
 		}
-		const auto permutation = std::ranges::find_if(
-		    entry->second.permutations, [&](const Permutation& candidate) {
+		const auto permutation =
+		    std::ranges::find_if(entry->second.permutations, [&](const Permutation& candidate) {
 			    return candidate.program.bindings.push_data_start_dword ==
 			               compiled.program.bindings.push_data_start_dword &&
 			           candidate.specialization == compiled.specialization;
@@ -354,8 +353,8 @@ struct PipelineCache::ProgramCache {
 
 	// Resolves a new source entry's resources from guest memory. Must run on the GPU
 	// thread: the GPU-clean memory reader inside MaterializeResources is only valid
-	// there. The resolved snapshot itself is discarded; the caller's cache probe
-	// re-materializes it when the draw retries.
+	// there. The snapshot stays in the job for the synchronous path; an asynchronous
+	// waiter discards it and re-materializes from its own cache probe.
 	void ResolveJobResources(CompileJob& job) {
 		KYTY_PROFILER_BLOCK("ShaderCompile ResolveResources", profiler::colors::Amber300);
 		const ShaderRecompiler::IR::SrtRuntime runtime {
@@ -364,17 +363,15 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .validate_memory_range      = ValidateShaderGuestMemoryRange,
 		};
-		ShaderRecompiler::IR::ResourceSnapshot snapshot;
-		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(job.resource_plan, runtime, snapshot,
-		                                                    job.specialization));
-		job.have_specialization = true;
+		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+		    job.resource_plan, runtime, job.probe_resources, job.specialization));
 	}
 
 	// Shader compiler thread, phase 2: SPIR-V emission and publication.
 	void EmitAndPublishJob(std::unique_ptr<CompileJob> job) {
 		KYTY_PROFILER_BLOCK("ShaderCompile EmitSPIRV", profiler::colors::CyanA700);
 		auto              compiled = EmitPermutation(*job);
-		Common::LockGuard lock(m_owner.m_mutex);
+		Common::LockGuard lock(owner.m_mutex);
 		InstallPermutation(*job, std::move(compiled));
 		pending.erase(job->key);
 	}
@@ -386,10 +383,9 @@ struct PipelineCache::ProgramCache {
 		KYTY_PROFILER_BLOCK("ShaderCompile Translate", profiler::colors::CyanA700);
 		job->translated = ShaderRecompiler::TranslateProgram(job->code, job->options);
 		if (!job->have_specialization) {
-			job->resource_plan =
-			    ShaderRecompiler::IR::ExtractResourcePlan(job->translated.program);
-			Common::LockGuard lock(m_owner.m_mutex);
-			m_materialize_requests.push_back(std::move(job));
+			job->resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(job->translated.program);
+			Common::LockGuard lock(owner.m_mutex);
+			materialize_requests.push_back(std::move(job));
 			return;
 		}
 		EmitAndPublishJob(std::move(job));
@@ -400,21 +396,19 @@ struct PipelineCache::ProgramCache {
 	void ServiceMaterializationRequests() {
 		std::vector<std::unique_ptr<CompileJob>> requests;
 		{
-			Common::LockGuard lock(m_owner.m_mutex);
-			requests = std::move(m_materialize_requests);
-			m_materialize_requests.clear();
+			Common::LockGuard lock(owner.m_mutex);
+			requests = std::move(materialize_requests);
 		}
 		for (auto& job: requests) {
 			ResolveJobResources(*job);
-			m_owner.m_shader_compiler->Submit([this, job = std::move(job)]() mutable {
-				EmitAndPublishJob(std::move(job));
-			});
+			owner.m_shader_compiler->Submit(
+			    [this, job = std::move(job)]() mutable { EmitAndPublishJob(std::move(job)); });
 		}
 	}
 
 	template <typename InputInfo>
-	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                 uint32_t& push_data_cursor, bool& shaders_pending, uint64_t& wait_target) {
+	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
+	                  bool& shaders_pending, uint64_t& wait_target) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -443,7 +437,8 @@ struct PipelineCache::ProgramCache {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, resources, specialization));
 			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
+			        entry->second.permutations,
+			        [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
 				        return layout.push_data_start_dword ==
 				                   ShaderRecompiler::IR::PushData::StartFor(
@@ -462,9 +457,9 @@ struct PipelineCache::ProgramCache {
 		// it runs inline or on the dedicated shader compiler thread. The job is built in
 		// place inside its final storage: options.input_info points into the stage-input
 		// copies, so the CompileJob itself must never be moved afterwards.
-		auto job_ptr = std::make_unique<CompileJob>();
-		auto& job    = *job_ptr;
-		job.key                 = lookup_key;
+		auto  job_ptr = std::make_unique<CompileJob>();
+		auto& job     = *job_ptr;
+		job.key       = lookup_key;
 		job.code.assign(params.code.begin(), params.code.end());
 		job.back_code.assign(params.back_code.begin(), params.back_code.end());
 		job.user_data           = params.user_data;
@@ -492,27 +487,26 @@ struct PipelineCache::ProgramCache {
 		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 			job.pixel_input              = input_info;
 			job.options.input_info.pixel = &job.pixel_input;
-			job.options.wave_size       = job.pixel_input.wave_size;
+			job.options.wave_size        = job.pixel_input.wave_size;
 		} else {
-			job.compute_input               = input_info;
-			job.options.input_info.compute  = &job.compute_input;
+			job.compute_input              = input_info;
+			job.options.input_info.compute = &job.compute_input;
 			job.options.wave_size          = job.compute_input.wave_size;
 		}
 
-		if (m_owner.ShaderCompilerActive()) {
+		if (owner.ShaderCompilerActive()) {
 			// A single in-flight job per program key: a concurrent waiter reuses the
 			// pending compilation instead of queueing a duplicate.
 			if (!pending.contains(lookup_key)) {
 				pending.insert(job_ptr->key);
-				m_owner.m_shader_compiler->Submit(
-				    [this, job = std::move(job_ptr)]() mutable {
-					    TranslateShaderJob(std::move(job));
-				    });
+				owner.m_shader_compiler->Submit([this, job = std::move(job_ptr)]() mutable {
+					TranslateShaderJob(std::move(job));
+				});
 			}
 			// Snapshot the completion count while the cache mutex is still held: no
 			// queued job can publish before this read, so the caller's wait always
 			// covers this request.
-			wait_target = m_owner.m_shader_compiler->CompletedCount();
+			wait_target     = owner.m_shader_compiler->CompletedCount();
 			shaders_pending = true;
 			return {};
 		}
@@ -522,28 +516,17 @@ struct PipelineCache::ProgramCache {
 		job.translated = ShaderRecompiler::TranslateProgram(job.code, job.options);
 		if (!job.have_specialization) {
 			job.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(job.translated.program);
-			const ShaderRecompiler::IR::SrtRuntime runtime {
-			    .user_data                  = job.user_data,
-			    .shader_base                = job.base_addr,
-			    .read_specialization_memory = ReadShaderGuestMemory,
-			    .validate_memory_range      = ValidateShaderGuestMemoryRange,
-			};
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(job.resource_plan, runtime,
-			                                                    job.probe_resources,
-			                                                    job.specialization));
+			ResolveJobResources(job);
 		}
-		{
-			auto compiled     = EmitPermutation(job);
-			auto& permutation = InstallPermutation(job, std::move(compiled));
-			input_info.stage  = {.program   = &permutation.program,
-			                    .resources = std::move(job.probe_resources)};
-			permutation.program.bindings.AdvancePushData(push_data_cursor);
-			return permutation.handle;
-		}
+		auto  compiled    = EmitPermutation(job);
+		auto& permutation = InstallPermutation(job, std::move(compiled));
+		input_info.stage  = {.program   = &permutation.program,
+		                     .resources = std::move(job.probe_resources)};
+		permutation.program.bindings.AdvancePushData(push_data_cursor);
+		return permutation.handle;
 	}
 
-	explicit ProgramCache(PipelineCache& owner, vk::Device device)
-	    : m_owner(owner), device(device) {
+	explicit ProgramCache(PipelineCache& owner, vk::Device device): owner(owner), device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -555,15 +538,15 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
-	PipelineCache&                                   m_owner;
+	PipelineCache&                                              owner;
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	// Program keys with a compilation queued or running on the compiler thread.
 	std::unordered_set<ProgramKey, ProgramKeyHash> pending;
 	// Translated jobs waiting for the GPU thread to resolve their resources.
-	std::vector<std::unique_ptr<CompileJob>>       m_materialize_requests;
-	ProgramKey                                      lookup_key;
-	vk::Device                                      device;
-	uint64_t                                        next_shader_id = 0;
+	std::vector<std::unique_ptr<CompileJob>> materialize_requests;
+	ProgramKey                               lookup_key;
+	vk::Device                               device;
+	uint64_t                                 next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -785,8 +768,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
-		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
-		const auto& blend          = context.GetBlendControl(0);
+		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		const auto& blend = context.GetBlendControl(0);
 		const auto  is_dual_source = [](uint8_t factor) {
 			return factor >= static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color) &&
 			       factor <= static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
@@ -857,17 +840,18 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
-	const auto params = PrepareProgram(regs, sh, input_info);
+	const auto params             = PrepareProgram(regs, sh, input_info);
 	// A cache miss compiles on the shader compiler thread; wait for it outside the
 	// cache mutex and re-probe.
 	for (;;) {
-		uint64_t    wait_target = 0;
-		bool        pending     = false;
+		uint64_t      wait_target = 0;
+		bool          pending     = false;
 		ShaderProgram program;
 		{
 			Common::LockGuard lock(m_mutex);
 			uint32_t          push_data_cursor = 0;
-			program = m_program_cache->Get(params, input_info, push_data_cursor, pending, wait_target);
+			program =
+			    m_program_cache->Get(params, input_info, push_data_cursor, pending, wait_target);
 			if (!pending) {
 				return program;
 			}

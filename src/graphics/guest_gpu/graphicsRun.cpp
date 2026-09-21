@@ -1103,7 +1103,6 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 
 		const auto& cs = m_sh_ctx.GetCs().cs_regs;
-		(void)cs;
 		// local_x        = std::max(cs.num_thread_x, 1u);
 		// local_y        = std::max(cs.num_thread_y, 1u);
 		// local_z        = std::max(cs.num_thread_z, 1u);

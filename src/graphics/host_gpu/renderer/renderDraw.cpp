@@ -906,8 +906,8 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
-                                             uint32_t            render_target_slice_offset,
-                                             DrawRenderState& state) {
+                                            uint32_t            render_target_slice_offset,
+	                                        DrawRenderState& state) {
 	state.ps_active = DrawHasActivePixelShader(buffer);
 	RefreshShaders(buffer, draw, state);
 	uint32_t mrt_mask = 0;
@@ -1196,7 +1196,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 }
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
-                                const DrawIndexArgs& args) {
+                               const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1300,14 +1300,14 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawEmitInfo emit {};
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
+
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
 	ResetBindings();
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer,
-                              const DrawAutoArgs& args) {
+void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
